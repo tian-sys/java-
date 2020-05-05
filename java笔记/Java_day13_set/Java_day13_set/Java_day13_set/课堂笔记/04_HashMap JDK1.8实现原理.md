@@ -1,0 +1,192 @@
+# HashMap JDK1.8实现原理
+
+
+
+## HashMap概述
+
+HashMap存储的是key-value的键值对，允许key为null，也允许value为null。HashMap内部为数组+链表的结构，会根据key的hashCode值来确定数组的索引(确认放在哪个桶里)，如果遇到索引相同的key，桶的大小是2，如果一个key的hashCode是7，一个key的hashCode是3，那么他们就会被分到一个桶中(hash冲突)，如果发生hash冲突，HashMap会将同一个桶中的数据以链表的形式存储，但是如果发生hash冲突的概率比较高，就会导致同一个桶中的链表长度过长，遍历效率降低，所以在JDK1.8中如果链表长度到达阀值(默认是8)，就会将链表转换成红黑二叉树。
+
+## HashMap数据结构
+
+![](img\1.png)
+
+```java
+ //Node本质上是一个Map.存储着key-value
+   static class Node<K,V> implements Map.Entry<K,V> {
+        final int hash;             //保存该桶的hash值
+        final K key;                //不可变的key
+        V value;                    
+        Node<K,V> next;      //指向一个数据的指针
+
+        Node(int hash, K key, V value, Node<K,V> next) {
+            this.hash = hash;
+            this.key = key;
+            this.value = value;
+            this.next = next;
+       }        
+```
+
+从源码上可以看到，Node实现了Map.Entry接口，本质上是一个映射(k-v)
+
+刚刚也说过了，有时候两个key的hashCode可能会定位到一个桶中，这时就发生了hash冲突，如果HashMap的hash算法越散列，那么发生hash冲突的概率越低，如果数组越大，那么发生hash冲突的概率也会越低，但是数组越大带来的空间开销越多，但是遍历速度越快，这就要在空间和时间上进行权衡，这就要看看HashMap的扩容机制，在说扩容机制之前先看几个比较重要的字段
+
+```java
+//默认桶16个
+static final int DEFAULT_INITIAL_CAPACITY = 1 << 4; // aka 16
+
+//默认桶最多有2^30个
+static final int MAXIMUM_CAPACITY = 1 << 30;
+
+//默认负载因子是0.75
+static final float DEFAULT_LOAD_FACTOR = 0.75f;
+
+//能容纳最多key_value对的个数
+ int threshold;
+
+//一共key_value对个数
+int size;
+```
+
+threshold=负载因子 * length，也就是说数组长度固定以后， 如果负载因子越大，所能容纳的元素个数越多，如果超过这个值就会进行扩容(默认是扩容为原来的2倍)，0.75这个值是权衡过空间和时间得出的，建议大家不要随意修改，如果在一些特殊情况下，比如空间比较多，但要求速度比较快，这时候就可以把扩容因子调小以较少hash冲突的概率。相反就增大扩容因子(这个值可以大于1)。
+
+size就是HashMap中键值对的总个数。还有一个字段是modCount，记录是发生内部结构变化的次数，如果put值，但是put的值是覆盖原有的值，这样是不算内部结构变化的。
+
+ 因为HashMap扩容每次都是扩容为原来的2倍，所以length总是2的次方，这是非常规的设置，常规设置是把桶的大小设置为素数，因为素数发生hash冲突的概率要小于合数，比如HashTable的默认值设置为11，就是桶的大小为素数的应用(HashTable扩容后不能保证是素数)。HashMap采用这种设置是为了在取模和扩容的时候做出优化。
+
+hashMap是通过key的hashCode的高16位和低16位异或后和桶的数量取模得到索引位置，即key.hashcode()^(hashcode>>>16)%length,当length是2^n时，h&（length-1）运算等价于h%length，而&操作比%效率更高。而采用高16位和低16位进行异或，也可以让所有的位数都参与越算，使得在length比较小的时候也可以做到尽量的散列。
+
+在扩容的时候，如果length每次是2^n，那么重新计算出来的索引只有两种情况，一种是 old索引+16，另一种是索引不变，所以就不需要每次都重新计算索引。 
+
+## 确定哈希桶数据索引位置
+
+```java
+//方法一：
+static final int hash(Object key) {   //jdk1.8 & jdk1.7
+     int h;
+     // h = key.hashCode() 为第一步 取hashCode值
+     // h ^ (h >>> 16)  为第二步 高位参与运算
+     return (key == null) ? 0 : (h = key.hashCode()) ^ (h >>> 16);
+}
+//方法二：
+static int indexFor(int h, int length) {  //jdk1.7的源码，jdk1.8没有这个方法，但是实现原理一样的
+     return h & (length-1);  //第三步 取模运算
+}
+```
+
+## HashMap的put方法实现
+
+ 思路如下：
+
+1.table[]是否为空
+
+2.判断table[i]处是否插入过值
+
+3.判断链表长度是否大于8，如果大于就转换为红黑二叉树，并插入树中
+
+4.判断key是否和原有key相同，如果相同就覆盖原有key的value，并返回原有value
+
+5.如果key不相同，就插入一个key，记录结构变化一次
+
+```java
+final V putVal(int hash, K key, V value, boolean onlyIfAbsent,
+                   boolean evict) {
+//判断table是否为空，如果是空的就创建一个table，并获取他的长度
+        Node<K,V>[] tab; Node<K,V> p; int n, i;
+        if ((tab = table) == null || (n = tab.length) == 0)
+            n = (tab = resize()).length;
+//如果计算出来的索引位置之前没有放过数据，就直接放入
+        if ((p = tab[i = (n - 1) & hash]) == null)
+            tab[i] = newNode(hash, key, value, null);
+        else {
+//进入这里说明索引位置已经放入过数据了
+            Node<K,V> e; K k;
+//判断put的数据和之前的数据是否重复
+            if (p.hash == hash &&
+                ((k = p.key) == key || (key != null && key.equals(k))))   //key的地址或key的equals()只要有一个相等就认为key重复了，就直接覆盖原来key的value
+                e = p;
+//判断是否是红黑树，如果是红黑树就直接插入树中
+            else if (p instanceof TreeNode)
+                e = ((TreeNode<K,V>)p).putTreeVal(this, tab, hash, key, value);
+            else {
+//如果不是红黑树，就遍历每个节点，判断链表长度是否大于8，如果大于就转换为红黑树
+                for (int binCount = 0; ; ++binCount) {
+                    if ((e = p.next) == null) {
+                        p.next = newNode(hash, key, value, null);
+                        if (binCount >= TREEIFY_THRESHOLD - 1) // -1 for 1st
+                            treeifyBin(tab, hash);
+                        break;
+                    }
+//判断索引每个元素的key是否可要插入的key相同，如果相同就直接覆盖
+                    if (e.hash == hash &&
+                        ((k = e.key) == key || (key != null && key.equals(k))))
+                        break;
+                    p = e;
+                }
+            }
+//如果e不是null，说明没有迭代到最后就跳出了循环，说明链表中有相同的key，因此只需要将value覆盖，并将oldValue返回即可
+            if (e != null) { // existing mapping for key
+                V oldValue = e.value;
+                if (!onlyIfAbsent || oldValue == null)
+                    e.value = value;
+                afterNodeAccess(e);
+                return oldValue;
+            }
+        }
+//说明没有key相同，因此要插入一个key-value，并记录内部结构变化次数
+        ++modCount;
+        if (++size > threshold)
+            resize();
+        afterNodeInsertion(evict);
+        return null;
+    }
+```
+
+## HashMap的get方法实现
+
+ 实现思路：
+
+1.判断表或key是否是null，如果是直接返回null
+
+2.判断索引处第一个key与传入key是否相等，如果相等直接返回
+
+3.如果不相等，判断链表是否是红黑二叉树，如果是，直接从树中取值
+
+4.如果不是树，就遍历链表查找
+
+```java
+final Node<K,V> getNode(int hash, Object key) {
+        Node<K,V>[] tab; Node<K,V> first, e; int n; K k;
+//如果表不是空的，并且要查找索引处有值，就判断位于第一个的key是否是要查找的key
+        if ((tab = table) != null && (n = tab.length) > 0 &&
+            (first = tab[(n - 1) & hash]) != null) {
+            if (first.hash == hash && // always check first node
+                ((k = first.key) == key || (key != null && key.equals(k))))
+//如果是，就直接返回
+                return first;
+//如果不是就判断链表是否是红黑二叉树，如果是，就从树中取值
+            if ((e = first.next) != null) {
+                if (first instanceof TreeNode)
+                    return ((TreeNode<K,V>)first).getTreeNode(hash, key);
+//如果不是树，就遍历链表
+                do {
+                    if (e.hash == hash &&
+                        ((k = e.key) == key || (key != null && key.equals(k))))
+                        return e;
+                } while ((e = e.next) != null);
+            }
+        }
+        return null;
+    }
+```
+
+## 扩容机制
+
+我们使用的是2次幂的扩展(指长度扩为原来2倍)，所以，元素的位置要么是在原位置，要么是在原位置再移动2次幂的位置。看下图可以明白这句话的意思，n为table的长度，图（a）表示扩容前的key1和key2两种key确定索引位置的示例，图（b）表示扩容后key1和key2两种key确定索引位置的示例，其中hash1是key1对应的哈希与高位运算结果。
+
+![](img\2.png)
+
+因此，我们在扩充HashMap的时候，不需要像JDK1.7的实现那样重新计算hash，只需要看看原来的hash值新增的那个bit是1还是0就好了，是0的话索引没变，是1的话索引变成“原索引+oldCap”，可以看看下图为16扩充为32的resize示意图：
+
+![](img\3.png)
+
+这个设计确实非常的巧妙，既省去了重新计算hash值的时间，而且同时，由于新增的1bit是0还是1可以认为是随机的，因此resize的过程，均匀的把之前的冲突的节点分散到新的bucket了。这一块就是JDK1.8新增的优化点。有一点注意区别，JDK1.7中rehash的时候，旧链表迁移新链表的时候，如果在新表的数组索引位置相同，则链表元素会倒置，但是从上图可以看出，JDK1.8不会倒置。
